@@ -12,9 +12,12 @@ import time
 import discord
 print("Discord.py Version:", discord.__version__)
 
+print("DEBUG: cn.py wurde gestartet!")
+print("DEBUG: Token geladen:", os.getenv("DISCORD_TOKEN"))
+
 keep_alive()
 
-TOKEN = os.getenv('DISCORD_TOKEN') or 'DeinTokenHier'
+TOKEN = os.getenv('DISCORD_TOKEN')
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -538,3 +541,4 @@ async def on_member_remove(member):
 # ------------------------
 
 bot.run(TOKEN)
+
