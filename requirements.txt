@@ -1,2 +1,1 @@
-discord.py
-flask
+discord.py==2.5.2
