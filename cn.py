@@ -1,4 +1,3 @@
-from keep_alive import keep_alive
 import discord
 from discord.ext import commands
 import re
@@ -14,8 +13,6 @@ print("Discord.py Version:", discord.__version__)
 
 print("DEBUG: cn.py wurde gestartet!")
 print("DEBUG: Token geladen:", os.getenv("DISCORD_TOKEN"))
-
-keep_alive()
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 
@@ -541,5 +538,6 @@ async def on_member_remove(member):
 # ------------------------
 
 bot.run(TOKEN)
+
 
 
