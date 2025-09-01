@@ -1,544 +1,299 @@
-import discord
-from discord.ext import commands
+import os
 import re
 import asyncio
-import os
-import json
-from discord import app_commands
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict
-import time
+import logging
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict, deque
+
 import discord
-print("Discord.py Version:", discord.__version__)
+from discord import AuditLogAction, Forbidden, HTTPException, NotFound, Member
 
-print("DEBUG: cn.py wurde gestartet!")
-print("DEBUG: Token geladen:", os.getenv("DISCORD_TOKEN"))
+# --------------------------
+# Konfiguration
+# --------------------------
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Umgebungsvariable DISCORD_TOKEN fehlt.")
 
-TOKEN = os.getenv('DISCORD_TOKEN')
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-intents.members = True
-intents.webhooks = True
-
-bot = commands.Bot(command_prefix='!', intents=intents)
-tree = bot.tree
-
-# ------------------------
-# WHITELIST & SETTINGS
-# ------------------------
-WHITELIST = {843180408152784936, 1159469934989025290,
-             662596869221908480, 830212609961754654,
-             235148962103951360, 557628352828014614,
+# Feste IDs im Code
+WHITELIST_IDS = {662596869221908480,843180408152784936,
+                 1271186898408308789,1197862712408014909,
 }
 
-AUTO_KICK_IDS = {968608295101292544, 1378153838732640347,
-                 1048582528455430184, 1325204584829947914,
-                 1318475995291848724, 1399007414488928286,
-}
-
-DELETE_TIMEOUT = 3600
-
-invite_violations = {}
-user_timeouts = {}
-webhook_violations = {}
-kick_violations = defaultdict(int)
-ban_violations = defaultdict(int)
-
-AUTHORIZED_ROLE_IDS = (1399874350093439060,)
-MAX_ALLOWED_KICKS = 3
-MAX_ALLOWED_BANS = 3
-
-SETUP_BACKUP_WHITELIST = {
-    1159469934989025290,  # Beispielhafte User-IDs
-    843180408152784936,
-}
-
-def is_setup_whitelisted(user_id: int) -> bool:
-    return user_id in SETUP_BACKUP_WHITELIST
-
-invite_pattern = re.compile(
-    r"(https?:\/\/)?(www\.)?(discord\.gg|discord(app)?\.com\/(invite|oauth2\/authorize))\/\w+|(?:discord(app)?\.com.*invite)", re.I
+# Regex für Discord-Invite-Links
+INVITE_REGEX = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:discord\.gg|discord\.com/invite)/[A-Za-z0-9\-]+",
+    re.IGNORECASE,
 )
 
-# ------------------------
-# Timeout-Spam Tracking (5 Timeouts in 120 Sek -> Kick)
-# ------------------------
+# Anti-Invite-Spanm: max 5 Invites in 15s
+INVITE_WINDOW_SECONDS = 15
+INVITE_MAX_IN_WINDOW = 5
+TIMEOUT_DURATION = timedelta(hours=1)
 
-timeout_actions = defaultdict(list)  # moderator_id : [timestamps]
-TIMEOUT_SPAM_LIMIT = 5
-TIME_WINDOW = 120  # Sekunden
+# Webhook-Versuche bis Kick
+WEBHOOK_MAX_ATTEMPTS = 3
 
-async def register_timeout_action(guild, moderator_id):
-    now = time.time()
-    actions = timeout_actions[moderator_id]
-    actions.append(now)
-    # Alte Aktionen entfernen, die außerhalb des Fensters sind
-    timeout_actions[moderator_id] = [t for t in actions if now - t <= TIME_WINDOW]
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("guardbot")
 
-    if len(timeout_actions[moderator_id]) >= TIMEOUT_SPAM_LIMIT:
-        member = guild.get_member(moderator_id)
-        if member:
-            try:
-                await member.kick(reason="Timeout-Spam (mehr als 5 Timeouts in 120 Sekunden)")
-                print(f"🥾 {member} wurde wegen Timeout-Spam gekickt.")
-                timeout_actions[moderator_id] = []  # Reset nach Kick
-            except Exception as e:
-                print(f"❌ Fehler beim Kick bei Timeout-Spam: {e}")
-@bot.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    # Prüfen, ob 'communication_disabled_until' bei beiden Membern existiert
-    if hasattr(before, "communication_disabled_until") and hasattr(after, "communication_disabled_until"):
-        if before.communication_disabled_until != after.communication_disabled_until:
-            # Wenn ein Timeout neu gesetzt wurde (nicht entfernt)
-            if after.communication_disabled_until is not None:
-                # Wer hat den Timeout vergeben? → Audit Log prüfen
-                async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.member_update):
-                    if entry.target.id == after.id:
-                        moderator_id = entry.user.id
-                        if not is_whitelisted(moderator_id):
-                            await register_timeout_action(after.guild, moderator_id)
-                        break
+# --------------------------
+# Discord Client / Intents
+# --------------------------
+intents = discord.Intents.default()
+intents.message_content = True     # Für Invite-Erkennung
+intents.members = True             # Für Member-Events
+intents.guilds = True
+intents.guild_reactions = False
+intents.presences = False
 
-# ------------------------
-# HILFSFUNKTIONEN
-# ------------------------
+bot = discord.Client(intents=intents)
 
-def is_whitelisted(user_id):
-    return user_id in WHITELIST
+# --------------------------
+# Zustände / Speicher
+# --------------------------
+# user_id -> deque[timestamps] der Invite-Posts
+invite_events: dict[int, deque[datetime]] = defaultdict(lambda: deque(maxlen=50))
 
-async def reset_rules_for_user(user, guild):
-    member = guild.get_member(user.id)
-    if member:
-        try:
-            roles_to_remove = [r for r in member.roles if r.name != "@everyone"]
-            await member.remove_roles(*roles_to_remove, reason="Reset nach 2x Webhook-Verstoß")
-            print(f"🔁 Rollen von {user} entfernt.")
-        except Exception as e:
-            print(f"❌ Fehler bei Rollenentfernung: {e}")
+# user_id -> Anzahl nicht erlaubter Webhook-Erstellungen
+webhook_attempts: defaultdict[int, int] = defaultdict(int)
 
-# ------------------------
-# BACKUP / RESET SERVER
-# ------------------------
+# Kleine Hilfs-Rate-Limiter fürs Audit-Log (um API zu schonen)
+last_audit_lookup: dict[tuple[int, str], datetime] = {}
 
-backup_data = {}
+# --------------------------
+# Utilities
+# --------------------------
+def is_whitelisted(user_id: int) -> bool:
+    return user_id in WHITELIST_IDS
 
-def serialize_channel(channel: discord.abc.GuildChannel):
-    data = {
-        "name": channel.name,
-        "type": channel.type,
-        "position": channel.position,
-        "category_id": channel.category_id,
-    }
-    if isinstance(channel, discord.TextChannel):
-        data.update({
-            "topic": channel.topic,
-            "nsfw": channel.nsfw,
-            "slowmode_delay": channel.slowmode_delay,
-            "bitrate": None,
-            "user_limit": None,
-        })
-    elif isinstance(channel, discord.VoiceChannel):
-        data.update({
-            "bitrate": channel.bitrate,
-            "user_limit": channel.user_limit,
-            "topic": None,
-            "nsfw": None,
-            "slowmode_delay": None,
-        })
-    else:
-        data.update({
-            "topic": None,
-            "nsfw": None,
-            "slowmode_delay": None,
-            "bitrate": None,
-            "user_limit": None,
-        })
-    return data
+async def safe_kick(guild: discord.Guild, member: Member, reason: str):
+    try:
+        if member and guild.get_member(member.id):
+            await guild.kick(member, reason=reason)
+            log.info(f"Gekickt: {member} ({member.id}) – {reason}")
+    except Forbidden:
+        log.warning(f"Kick verboten für {member} ({member.id}) – fehlende Rechte?")
+    except HTTPException as e:
+        log.warning(f"Kick fehlgeschlagen für {member} ({member.id}): {e}")
 
-async def create_channel_from_backup(guild: discord.Guild, data):
-    category = guild.get_channel(data["category_id"]) if data["category_id"] else None
+async def try_timeout(member: Member, duration: timedelta, reason: str) -> bool:
+    try:
+        until = discord.utils.utcnow() + duration
+        await member.edit(timed_out_until=until, reason=reason)
+        log.info(f"Timeout: {member} ({member.id}) für {duration} – {reason}")
+        return True
+    except Forbidden:
+        log.warning(f"Timeout verboten für {member} – versuche Kick …")
+        return False
+    except HTTPException as e:
+        log.warning(f"Timeout fehlgeschlagen für {member}: {e}")
+        return False
 
-    if data["type"] == discord.ChannelType.text:
-        return await guild.create_text_channel(
-            name=data["name"],
-            topic=data["topic"],
-            nsfw=data["nsfw"],
-            slowmode_delay=data["slowmode_delay"],
-            category=category,
-            position=data["position"]
-        )
-    elif data["type"] == discord.ChannelType.voice:
-        return await guild.create_voice_channel(
-            name=data["name"],
-            bitrate=data["bitrate"],
-            user_limit=data["user_limit"],
-            category=category,
-            position=data["position"]
-        )
-    elif data["type"] == discord.ChannelType.category:
-        return await guild.create_category(
-            name=data["name"],
-            position=data["position"]
-        )
-    else:
-        return None
+async def find_audit_actor(
+    guild: discord.Guild,
+    action: AuditLogAction,
+    target_id: int | None = None,
+    within_seconds: int = 20,
+) -> discord.User | None:
+    """
+    Hole den Täter (actor) aus dem Audit-Log für eine frische Aktion.
+    Optional: auf target_id matchen und nur Einträge der letzten N Sekunden betrachten.
+    """
+    # Rate-Limit pro Aktion
+    key = (guild.id, f"{action}:{target_id}")
+    now = datetime.now(timezone.utc)
+    if key in last_audit_lookup and (now - last_audit_lookup[key]).total_seconds() < 1.0:
+        await asyncio.sleep(1)
+    last_audit_lookup[key] = now
 
-@tree.command(name="backup", description="Erstelle ein Backup aller Kanäle im Server.")
-async def backup(interaction: discord.Interaction):
-    if not is_setup_whitelisted(interaction.user.id):
-        await interaction.response.send_message("❌ Du bist nicht berechtigt, diesen Befehl zu verwenden.", ephemeral=True)
-        return
+    try:
+        async for entry in guild.audit_logs(limit=8, action=action):
+            # Zeitfenster prüfen
+            if entry.created_at and (now - entry.created_at).total_seconds() > within_seconds:
+                continue
+            if target_id is not None:
+                # target kann Snowflake mit .id sein
+                tgt = getattr(entry.target, "id", None)
+                if tgt != target_id:
+                    continue
+            return entry.user  # Täter
+    except Forbidden:
+        log.warning("Keine Berechtigung: View Audit Log")
+    except HTTPException as e:
+        log.warning(f"Audit-Log-Fehler: {e}")
+    return None
 
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("❌ Kein Server gefunden.", ephemeral=True)
-        return
-
-    channels_data = []
-    channels_sorted = sorted(guild.channels, key=lambda c: c.position)
-
-    for ch in channels_sorted:
-        channels_data.append(serialize_channel(ch))
-
-    backup_data[guild.id] = channels_data
-    await interaction.response.send_message(f"✅ Backup für **{guild.name}** mit {len(channels_data)} Kanälen wurde gespeichert.")
-
-@tree.command(name="reset", description="Starte Reset-Aktion. Optionen: 'server'")
-@app_commands.describe(option="Option für Reset, z.B. 'server'")
-async def reset(interaction: discord.Interaction, option: str):
-    if not is_setup_whitelisted(interaction.user.id):
-        await interaction.response.send_message("❌ Du bist nicht berechtigt, diesen Befehl zu verwenden.", ephemeral=True)
-        return
-
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("❌ Kein Server gefunden.", ephemeral=True)
-        return
-
-    if option.lower() != "server":
-        await interaction.response.send_message("❌ Unbekannte Option. Nur 'server' ist erlaubt.", ephemeral=True)
-        return
-
-    if guild.id not in backup_data:
-        await interaction.response.send_message("❌ Kein Backup für diesen Server gefunden. Bitte erst /backup ausführen.", ephemeral=True)
-        return
-
-    await interaction.response.send_message("⚠️ Starte Server Reset: Kanäle werden gelöscht und aus Backup wiederhergestellt...", ephemeral=True)
-
-    for ch in guild.channels:
-        try:
-            await ch.delete(reason="Reset Server durch Bot")
-            await asyncio.sleep(0.6)
-        except Exception as e:
-            print(f"Fehler beim Löschen von Kanal {ch.name}: {e}")
-
-    await asyncio.sleep(3)
-
-    channels_backup = backup_data[guild.id]
-
-    categories = [c for c in channels_backup if c["type"] == discord.ChannelType.category]
-    category_map = {}
-
-    for cat_data in categories:
-        cat = await create_channel_from_backup(guild, cat_data)
-        if cat:
-            category_map[cat_data["name"]] = cat
-
-    for ch_data in channels_backup:
-        if ch_data["type"] == discord.ChannelType.category:
-            continue
-
-        if ch_data["category_id"]:
-            orig_cat = guild.get_channel(ch_data["category_id"])
-            cat_name = orig_cat.name if orig_cat else None
-            if cat_name in category_map:
-                ch_data["category_id"] = category_map[cat_name].id
-            else:
-                ch_data["category_id"] = None
-        else:
-            ch_data["category_id"] = None
-
-        await create_channel_from_backup(guild, ch_data)
-        await asyncio.sleep(0.6)
-    await interaction.followup.send("✅ Server Reset abgeschlossen. Kanäle wurden wiederhergestellt.")
-
-# ------------------------
-# EVENTS
-# ------------------------
-
+# --------------------------
+# Events
+# --------------------------
 @bot.event
 async def on_ready():
-    print(f'✅ {bot.user} ist online!')
-    try:
-        synced = await tree.sync()
-        print(f"🔃 {len(synced)} Slash-Commands synchronisiert.")
-    except Exception as e:
-        print("❌ Fehler beim Slash-Sync:", e)
+    log.info(f"Eingeloggt als {bot.user} (ID: {bot.user.id})")
+    log.info(f"Whitelist: {sorted(WHITELIST_IDS) if WHITELIST_IDS else 'leer'}")
 
 @bot.event
-async def on_member_join(member):
-    # Bot-Join-Schutz und Auto-Kick IDs (Kein Account-Alter-Check mehr)
-    if member.bot and not is_whitelisted(member.id):
-        async for entry in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.bot_add):
-            if entry.target.id == member.id:
-                adder = entry.user
-                if adder and not is_whitelisted(adder.id):
-                    try:
-                        await adder.ban(reason="🛡️ Bot-Join-Schutz: Nutzer hat Bot hinzugefügt")
-                        await member.ban(reason="🛡️ Bot-Join-Schutz: Bot wurde entfernt")
-                        print(f"🥾 {adder} und Bot {member} wurden wegen Bot-Join-Schutz gekickt.")
-                    except Exception as e:
-                        print(f"❌ Fehler beim Kick (Bot-Join-Schutz): {e}")
-                break
+async def on_message(message: discord.Message):
+    # Bot-eigene Nachrichten ignorieren
+    if message.author.bot or message.guild is None:
         return
 
-    if member.id in AUTO_KICK_IDS:
-        try:
-            await member.kick(reason="Auto-Kick: Gelistete ID")
-            print(f"🥾 {member} wurde automatisch gekickt (gelistete ID).")
-        except Exception as e:
-            print(f"❌ Fehler beim Auto-Kick: {e}")
-        return
-
-@bot.event
-async def on_webhooks_update(channel):
-    print(f"🔄 Webhook Update erkannt in {channel.name}")
-    await asyncio.sleep(0)
-    try:
-        webhooks = await channel.webhooks()
-        for webhook in webhooks:
-            print(f"🧷 Webhook gefunden: {webhook.name} ({webhook.id})")
-            if webhook.user and is_whitelisted(webhook.user.id):
-                print(f"✅ Whitelisted: {webhook.user}")
-                continue
-            user = None
-            async for entry in channel.guild.audit_logs(limit=10, action=discord.AuditLogAction.webhook_create):
-                if entry.target and entry.target.id == webhook.id:
-                    user = entry.user
-                    break
-            await webhook.delete(reason="🔒 Unautorisierter Webhook")
-            print(f"❌ Webhook {webhook.name} gelöscht")
-            if user and not is_whitelisted(user.id):
-                count = webhook_violations.get(user.id, 0) + 1
-                webhook_violations[user.id] = count
-                print(f"⚠ Webhook-Verstoß #{count} von {user}")
-                if count >= 2:
-                    await reset_rules_for_user(user, channel.guild)
-    except Exception as e:
-        print("❌ Fehler bei Webhook Handling:")
-        import traceback
-        traceback.print_exc()
-
-@bot.event
-async def on_message(message):
-    if is_whitelisted(message.author.id):
-        await bot.process_commands(message)
-        return
-    now_ts = datetime.now(timezone.utc).timestamp()
-    if message.author.id in user_timeouts:
-        if user_timeouts[message.author.id] > now_ts:
-            try:
-                await message.delete()
-                print(f"🚫 Nachricht von getimtem User {message.author} gelöscht.")
-            except:
-                pass
-            return
-        else:
-            del user_timeouts[message.author.id]
-    if invite_pattern.search(message.content):
+    # Invite-Links finden & löschen
+    if INVITE_REGEX.search(message.content or ""):
         try:
             await message.delete()
-            print(f"🚫 Invite-Link gelöscht von {message.author}")
-        except Exception as e:
-            print(f"❌ Fehler beim Invite-Löschen: {e}")
-        count = invite_violations.get(message.author.id, 0) + 1
-        invite_violations[message.author.id] = count
-        print(f"⚠ Invite-Verstoß #{count} von {message.author}")
-        if count >= 3:
-            try:
-                await message.author.timeout(duration=DELETE_TIMEOUT, reason="🔇 3x Invite-Verstoß")
-                user_timeouts[message.author.id] = now_ts + DELETE_TIMEOUT
-                print(f"⏱ {message.author} wurde für 1 Stunde getimeoutet.")
-            except Exception as e:
-                print(f"❌ Fehler beim Timeout: {e}")
-    await bot.process_commands(message)
+            log.info(f"Invite gelöscht von {message.author} in #{message.channel}")
+        except (Forbidden, NotFound):
+            pass
+        except HTTPException as e:
+            log.warning(f"Invite-Löschung fehlgeschlagen: {e}")
 
-# ------------------------
-# Rollenlösch-, Kanallösch- & Kanal-Erstell-Schutz mit Kick (Ersetzt Nr.6)
-# ------------------------
+        # Anti-Invite-Spam (Whitelist ausgenommen)
+        if not is_whitelisted(message.author.id):
+            now = datetime.now(timezone.utc)
+            dq = invite_events[message.author.id]
+            dq.append(now)
 
-@bot.event
-async def on_guild_role_delete(role):
-    guild = role.guild
-    async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.role_delete):
-        if entry.target.id == role.id:
-            user = entry.user
-            break
-    else:
-        return
-    if not user or is_whitelisted(user.id):
-        return
-    member = guild.get_member(user.id)
-    if member:
-        try:
-            await member.kick(reason="🧪 Rolle gelöscht ohne Erlaubnis")
-            print(f"🥾 {member} wurde gekickt (Rolle gelöscht).")
-        except Exception as e:
-            print(f"❌ Fehler beim Kick: {e}")
+            # Fenster säubern
+            while dq and (now - dq[0]).total_seconds() > INVITE_WINDOW_SECONDS:
+                dq.popleft()
 
-@bot.event
-async def on_guild_channel_delete(channel):
-    guild = channel.guild
-    async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_delete):
-        if entry.target.id == channel.id:
-            user = entry.user
-            break
-    else:
-        return
-    if not user or is_whitelisted(user.id):
-        return
-    member = guild.get_member(user.id)
-    if member:
-        try:
-            await member.kick(reason="🧪 Kanal gelöscht ohne Erlaubnis")
-            print(f"🥾 {member} wurde gekickt (Kanal gelöscht).")
-        except Exception as e:
-            print(f"❌ Fehler beim Kick: {e}")
-
-@bot.event
-async def on_guild_channel_create(channel):
-    guild = channel.guild
-    async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_create):
-        if entry.target.id == channel.id:
-            user = entry.user
-            break
-    else:
-        return
-    if not user or is_whitelisted(user.id):
-        return
-    member = guild.get_member(user.id)
-    if member:
-        try:
-            await member.kick(reason="🧪 Kanal erstellt ohne Erlaubnis")
-            print(f"🥾 {member} wurde gekickt (Kanal erstellt).")
-        except Exception as e:
-            print(f"❌ Fehler beim Kick: {e}")
-
-# ------------------------
-# 1. Fehlender Abschnitt: Channel Namen-Änderung
-# ------------------------
-
-@bot.event
-async def on_guild_channel_update(before, after):
-    if before.name != after.name:
-        # Überprüfen ob die Änderung von einem Whitelisted User stammt
-        guild = after.guild
-        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_update):
-            if entry.target.id == after.id and entry.before.name == before.name and entry.after.name == after.name:
-                user = entry.user
-                if not user or is_whitelisted(user.id):
-                    return
-                member = guild.get_member(user.id)
+            if len(dq) >= INVITE_MAX_IN_WINDOW:
+                member = message.guild.get_member(message.author.id)
                 if member:
-                    try:
-                        await member.kick(reason="🧪 Kanalnamen ohne Erlaubnis geändert")
-                        print(f"🥾 {member} wurde gekickt (Kanalname geändert).")
-                    except Exception as e:
-                        print(f"❌ Fehler beim Kick (Channel Name Change): {e}")
-                break
-
-# ------------------------
-# 2. Ban/Kick Sicherheitsmechanismus (Erweitert)
-# ------------------------
+                    reason = f"Invite-Spam: ≥{INVITE_MAX_IN_WINDOW} in {INVITE_WINDOW_SECONDS}s"
+                    ok = await try_timeout(member, TIMEOUT_DURATION, reason)
+                    if not ok:
+                        await safe_kick(message.guild, member, reason)
 
 @bot.event
-async def on_member_ban(guild, user):
-    # Erkennen, wer gebannt hat
-    async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.ban):
-        if entry.target.id == user.id:
-            moderator = entry.user
-            break
-    else:
-        return
-
-    if moderator is None:
-        return
-
-    if is_whitelisted(moderator.id):
-        return
-
-    # Spezialrolle prüfen
-    member = guild.get_member(moderator.id)
-    has_special_role = False
-    if member:
-        has_special_role = any(role.id in AUTHORIZED_ROLE_IDS for role in member.roles)
-
-    if has_special_role:
-        ban_violations[moderator.id] += 1
-        if ban_violations[moderator.id] > MAX_ALLOWED_BANS:
-            try:
-                await member.kick(reason="🔒 Spezialrolle hat Bann-Limit überschritten")
-                print(f"🥾 {member} wurde wegen Bann-Limit gekickt.")
-            except Exception as e:
-                print(f"❌ Fehler beim Kick (Ban-Limit): {e}")
-    else:
-        # Kein Whitelist und keine Spezialrolle: Kick sofort
-        try:
-            if member:
-                await member.kick(reason="🔒 Bann ohne Erlaubnis")
-                print(f"🥾 {member} wurde wegen unautorisiertem Bann gekickt.")
-        except Exception as e:
-            print(f"❌ Fehler beim Kick (Ban): {e}")
+async def on_member_join(member: Member):
+    # Bot hinzugefügt?
+    if member.bot:
+        await asyncio.sleep(1)  # kurz warten, bis Audit-Log geschrieben ist
+        actor = await find_audit_actor(member.guild, AuditLogAction.bot_add, target_id=member.id)
+        if actor and not is_whitelisted(actor.id):
+            # Bot kicken
+            await safe_kick(member.guild, member, "Nicht-whitelisteter Bot-Invite")
+            # Einladenden kicken
+            inviter_member = member.guild.get_member(actor.id)
+            if inviter_member:
+                await safe_kick(member.guild, inviter_member, "Bot-Invite ohne Whitelist")
 
 @bot.event
-async def on_member_kick(guild, user):
-    # Discord.py hat kein on_member_kick Event, wir brauchen workaround
-    pass
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    await asyncio.sleep(1)
+    actor = await find_audit_actor(channel.guild, AuditLogAction.channel_delete, target_id=channel.id)
+    if actor and not is_whitelisted(actor.id):
+        m = channel.guild.get_member(actor.id)
+        if m:
+            await safe_kick(channel.guild, m, "Kanal gelöscht ohne Whitelist")
 
 @bot.event
-async def on_member_remove(member):
-    # Hier versuchen wir rauszufinden, ob es ein Kick war
-    # Wir prüfen Audit-Logs der letzten Sekunden auf Kick-Einträge
+async def on_guild_role_delete(role: discord.Role):
+    await asyncio.sleep(1)
+    actor = await find_audit_actor(role.guild, AuditLogAction.role_delete, target_id=role.id)
+    if actor and not is_whitelisted(actor.id):
+        m = role.guild.get_member(actor.id)
+        if m:
+            await safe_kick(role.guild, m, "Rolle gelöscht ohne Whitelist")
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User | discord.Member):
+    await asyncio.sleep(1)
+    actor = await find_audit_actor(guild, AuditLogAction.ban, target_id=user.id)
+    if actor and not is_whitelisted(actor.id):
+        m = guild.get_member(actor.id)
+        if m:
+            await safe_kick(guild, m, "Ban ohne Whitelist")
+
+@bot.event
+async def on_member_remove(member: Member):
+    """
+    Unterscheide freiwilligen Leave vs Kick:
+    Prüfe Audit-Log auf jüngsten MEMBER_KICK für dieses Target.
+    """
+    await asyncio.sleep(1)
     guild = member.guild
+    actor = await find_audit_actor(guild, AuditLogAction.kick, target_id=member.id)
+    if actor and not is_whitelisted(actor.id):
+        m = guild.get_member(actor.id)
+        if m:
+            await safe_kick(guild, m, "Kick ohne Whitelist")
+
+@bot.event
+async def on_webhooks_update(channel: discord.abc.GuildChannel):
+    """
+    Wird ausgelöst, wenn Webhooks eines Kanals geändert wurden.
+    - Suche im Audit-Log nach WEBHOOK_CREATE/UPDATE.
+    - Lösche Webhooks von nicht-whitelisteten Erstellern.
+    - Nach 3 Versuchen: Kick des Erstellers.
+    """
+    guild = channel.guild
+    await asyncio.sleep(1)
+
+    # Prüfe neueste Webhook-Create-Einträge
     try:
-        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.kick):
-            time_diff = (datetime.now(timezone.utc) - entry.created_at).total_seconds()
-            if entry.target.id == member.id and time_diff < 10:
-                moderator = entry.user
-                if is_whitelisted(moderator.id):
-                    return
-                mod_member = guild.get_member(moderator.id)
-                has_special_role = False
-                if mod_member:
-                    has_special_role = any(role.id in AUTHORIZED_ROLE_IDS for role in mod_member.roles)
-                if has_special_role:
-                    kick_violations[moderator.id] += 1
-                    if kick_violations[moderator.id] > MAX_ALLOWED_KICKS:
+        async for entry in guild.audit_logs(limit=6, action=AuditLogAction.webhook_create):
+            # nur sehr frische Einträge betrachten
+            now = datetime.now(timezone.utc)
+            if entry.created_at and (now - entry.created_at).total_seconds() > 30:
+                continue
+
+            actor = entry.user
+            target_webhook = entry.target  # sollte ein Webhook-Objekt mit id sein
+            if actor is None or target_webhook is None:
+                continue
+
+            if is_whitelisted(actor.id):
+                continue  # erlaubt
+
+            # Versuche, den konkreten Webhook per ID zu finden und zu löschen
+            wh = None
+            try:
+                hooks = await channel.webhooks()
+                wh = next((w for w in hooks if w.id == getattr(target_webhook, "id", None)), None)
+                if wh is None:
+                    # Fallback: in gesamter Guild suchen
+                    for ch in guild.text_channels:
                         try:
-                            await mod_member.kick(reason="🔒 Spezialrolle hat Kick-Limit überschritten")
-                            print(f"🥾 {mod_member} wurde wegen Kick-Limit gekickt.")
-                        except Exception as e:
-                            print(f"❌ Fehler beim Kick (Kick-Limit): {e}")
-                else:
-                    # Kein Whitelist und keine Spezialrolle: Kick sofort
-                    try:
-                        if mod_member:
-                            await mod_member.kick(reason="🔒 Kick ohne Erlaubnis")
-                            print(f"🥾 {mod_member} wurde wegen unautorisiertem Kick gekickt.")
-                    except Exception as e:
-                        print(f"❌ Fehler beim Kick (Kick): {e}")
-                break
-    except Exception as e:
-        print(f"❌ Fehler beim Kick-Check on_member_remove: {e}")
+                            for w in await ch.webhooks():
+                                if w.id == getattr(target_webhook, "id", None):
+                                    wh = w
+                                    break
+                            if wh:
+                                break
+                        except Forbidden:
+                            continue
+                if wh:
+                    await wh.delete(reason="Webhook von nicht-whitelistetem Nutzer")
+                    log.info(f"Webhook gelöscht (ID {wh.id}) – Actor {actor} ({actor.id})")
+            except Forbidden:
+                log.warning("Fehlende Rechte zum Löschen von Webhooks.")
+            except HTTPException as e:
+                log.warning(f"Webhook-Löschung fehlgeschlagen: {e}")
 
-# ------------------------
-# Bot starten
-# ------------------------
+            # Versuche zählen und ggf. User kicken
+            webhook_attempts[actor.id] += 1
+            if webhook_attempts[actor.id] >= WEBHOOK_MAX_ATTEMPTS:
+                member = guild.get_member(actor.id)
+                if member:
+                    await safe_kick(guild, member, "Mehrfach unzulässige Webhook-Erstellung")
+                # Zähler zurücksetzen, damit nicht sofort erneut getriggert wird
+                webhook_attempts[actor.id] = 0
 
-bot.run(TOKEN)
+    except Forbidden:
+        log.warning("Keine Berechtigung auf Audit-Log oder Webhooks.")
+    except HTTPException as e:
+        log.warning(f"Audit-Log/Webhook Fehler: {e}")
 
-
-
-
+# --------------------------
+# Start
+# --------------------------
+if __name__ == "__main__":
+    # Hinweis: Auf Railway genügt "python main.py"
+    bot.run(TOKEN)
