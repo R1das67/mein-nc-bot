@@ -18,6 +18,8 @@ if not TOKEN:
 # Feste IDs im Code
 WHITELIST_IDS = {662596869221908480,843180408152784936,
                  1271186898408308789,1197862712408014909,
+                 557628352828014614,651095740390834176,
+                 235148962103951360,
 }
 
 # Regex für Discord-Invite-Links
@@ -297,3 +299,4 @@ async def on_webhooks_update(channel: discord.abc.GuildChannel):
 if __name__ == "__main__":
     # Hinweis: Auf Railway genügt "python main.py"
     bot.run(TOKEN)
+
