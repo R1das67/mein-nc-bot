@@ -144,33 +144,34 @@ async def on_message(message: discord.Message):
     if message.author.bot or message.guild is None:
         return
 
-    # Invite-Links finden & löschen
-    if INVITE_REGEX.search(message.content or ""):
-        try:
-            await message.delete()
-            log.info(f"Invite gelöscht von {message.author} in #{message.channel}")
-        except (Forbidden, NotFound):
-            pass
-        except HTTPException as e:
-            log.warning(f"Invite-Löschung fehlgeschlagen: {e}")
+    # Nur Nicht-Whitelist prüfen
+    if not is_whitelisted(message.author.id):
+        # Invite-Links finden & löschen
+        if INVITE_REGEX.search(message.content or ""):
+            try:
+                await message.delete()
+                log.info(f"Invite gelöscht von {message.author} in #{message.channel}")
+            except (Forbidden, NotFound):
+                pass
+            except HTTPException as e:
+                log.warning(f"Invite-Löschung fehlgeschlagen: {e}")
 
-        # Anti-Invite-Spam (Whitelist ausgenommen)
-        if not is_whitelisted(message.author.id):
-            now = datetime.now(timezone.utc)
-            dq = invite_events[message.author.id]
-            dq.append(now)
+        # Anti-Invite-Spam
+        now = datetime.now(timezone.utc)
+        dq = invite_events[message.author.id]
+        dq.append(now)
 
-            # Fenster säubern
-            while dq and (now - dq[0]).total_seconds() > INVITE_WINDOW_SECONDS:
-                dq.popleft()
+        # Fenster säubern
+        while dq and (now - dq[0]).total_seconds() > INVITE_WINDOW_SECONDS:
+            dq.popleft()
 
-            if len(dq) >= INVITE_MAX_IN_WINDOW:
-                member = message.guild.get_member(message.author.id)
-                if member:
-                    reason = f"Invite-Spam: ≥{INVITE_MAX_IN_WINDOW} in {INVITE_WINDOW_SECONDS}s"
-                    ok = await try_timeout(member, TIMEOUT_DURATION, reason)
-                    if not ok:
-                        await safe_kick(message.guild, member, reason)
+        if len(dq) >= INVITE_MAX_IN_WINDOW:
+            member = message.guild.get_member(message.author.id)
+            if member:
+                reason = f"Invite-Spam: ≥{INVITE_MAX_IN_WINDOW} in {INVITE_WINDOW_SECONDS}s"
+                ok = await try_timeout(member, TIMEOUT_DURATION, reason)
+                if not ok:
+                    await safe_kick(message.guild, member, reason)
 
 @bot.event
 async def on_member_join(member: Member):
@@ -299,5 +300,4 @@ async def on_webhooks_update(channel: discord.abc.GuildChannel):
 if __name__ == "__main__":
     # Hinweis: Auf Railway genügt "python main.py"
     bot.run(TOKEN)
-
 
