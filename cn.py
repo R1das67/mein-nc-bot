@@ -16,7 +16,7 @@ if not TOKEN:
     raise RuntimeError("Umgebungsvariable DISCORD_TOKEN fehlt.")
 
 # Feste IDs im Code
-WHITELIST_IDS = {557628352828014614,651095740390834176
+WHITELIST_IDS = {557628352828014614,651095740390834176,
                  235148962103951360,1271186898408308789,
 }
 
@@ -298,6 +298,7 @@ async def on_webhooks_update(channel: discord.abc.GuildChannel):
 if __name__ == "__main__":
     # Hinweis: Auf Railway genügt "python main.py"
     bot.run(TOKEN)
+
 
 
 
